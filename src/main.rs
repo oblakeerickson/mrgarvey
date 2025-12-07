@@ -162,7 +162,7 @@ fn main() {
             println!("{json}");
         }
 
-        Commands::New { domain, dry_run } => {
+        Commands::New { domain, multisite_path, dry_run } => {
             let slug = generate_slug();
             let plan = build_site_plan(&slug, &domain);
 
@@ -202,7 +202,7 @@ EOF\"",
             println!("{}", multisite_yaml_block(&plan));
 
             println!();
-            update_multisite_file(&plan, &cli.multisite_path, dry_run);
+            update_multisite_file(&plan, &multisite_path, dry_run);
         }
     }
 }
