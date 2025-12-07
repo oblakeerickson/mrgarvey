@@ -1,0 +1,8 @@
+# example multisite.yml
+try_discourse:
+  adapter: postgresql
+  database: try_discourse
+  host_names:
+    - "try.ofcourse.chat"
+  pool: 25
+  timeout: 5000

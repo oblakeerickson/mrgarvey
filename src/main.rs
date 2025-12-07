@@ -1,4 +1,8 @@
 use std::process::Command;
+use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::Path;
 
 use clap::{Parser, Subcommand};
 use rand::seq::SliceRandom;
@@ -54,6 +58,63 @@ fn multisite_yaml_block(plan: &SitePlan) -> String {
     )
 }
 
+fn update_multisite_file(plan: &SitePlan, path: &str, dry_run: bool) {
+    let block = multisite_yaml_block(plan);
+    let key_line = format!("{}:", plan.rails_db_key);
+    let path_obj = Path::new(path);
+
+    let existing = if path_obj.exists() {
+        match fs::read_to_string(path_obj) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[ERROR   ] could not read {path}: {e}");
+                return;
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    if existing.contains(&key_line) {
+        println!("[INFO    ] multisite.yml already contains key `{}`; skipping append.", plan.rails_db_key);
+        return;
+    }
+
+    if dry_run {
+        println!("[DRY RUN] would append to {path}:\n{block}");
+        return;
+    }
+
+    println!("[RUN     ] appending new site block to {path}");
+
+    let mut file = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path_obj)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("[ERROR   ] could not open {path} for append: {e}");
+            return;
+        }
+    };
+
+    // If file isn't empty and doesn't end with newline, add one
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        if let Err(e) = file.write_all(b"\n") {
+            eprintln!("[ERROR   ] failed to write newline to {path}: {e}");
+            return;
+        }
+    }
+
+    if let Err(e) = file.write_all(block.as_bytes()) {
+        eprintln!("[ERROR   ] failed to append block to {path}: {e}");
+        return;
+    }
+
+    println!("[OK      ] appended site block for `{}`", plan.rails_db_key);
+}
+
 #[derive(Parser)]
 #[command(name = "mrgarvey", version, about = "ofcourse multisite provisioner helper")]
 struct Cli {
@@ -79,6 +140,10 @@ enum Commands {
         /// Base domain (default: ofcourse.chat)
         #[arg(long, default_value = "ofcourse.chat")]
         domain: String,
+
+        /// Path to multisite.yml (local dev default; on server you'll point to the real file)
+        #[arg(long, default_value = "multisite.yml")]
+        multisite_path: String,
 
         /// Print commands without executing them
         #[arg(long)]
@@ -135,6 +200,9 @@ EOF\"",
             println!();
             println!("multisite.yml snippet:");
             println!("{}", multisite_yaml_block(&plan));
+
+            println!();
+            update_multisite_file(&plan, &cli.multisite_path, dry_run);
         }
     }
 }
