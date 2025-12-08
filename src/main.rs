@@ -167,11 +167,11 @@ fn main() {
             let plan = build_site_plan(&slug, &domain);
 
             // Print the plan as JSON first
-
             let json = serde_json::to_string_pretty(&plan).expect("serialize plan");
             println!("{json}");
             println!();
 
+            // Build the commands we *would* run on the multisite host.
             let db_cmd = format!(
                 "docker exec app bash -lc \"sudo -u postgres createdb {db} && \
                  sudo -u postgres psql {db} <<EOF\n\
@@ -189,20 +189,25 @@ EOF\"",
                 rails_db = plan.rails_db_key
             );
 
-            let restart_cmd =
-                "docker exec app sv restart unicorn".to_string();
+            let restart_cmd = "docker exec app sv restart unicorn".to_string();
 
             println!("Planned commands:");
-            run_step("create_database", &db_cmd, dry_run);
-            run_step("migrate_and_seed", &migrate_cmd, dry_run);
-            run_step("restart_unicorn", &restart_cmd, dry_run);
 
+            // 1) Create DB
+            run_step("create_database", &db_cmd, dry_run);
+
+            // 2) Update multisite.yml
             println!();
             println!("multisite.yml snippet:");
             println!("{}", multisite_yaml_block(&plan));
-
             println!();
             update_multisite_file(&plan, &multisite_path, dry_run);
+
+            // 3) Migrate & seed
+            run_step("migrate_and_seed", &migrate_cmd, dry_run);
+
+            // 4) Restart unicorn
+            run_step("restart_unicorn", &restart_cmd, dry_run);
         }
     }
 }
