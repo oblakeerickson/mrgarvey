@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use serde::Serialize;
+use reqwest::blocking::Client;
 
 const ADJECTIVES: &[&str] = &[
     "fancy", "bright", "quiet", "lucky", "golden", "rusty", "brave", "clever", "calm", "swift",
@@ -115,6 +116,66 @@ fn update_multisite_file(plan: &SitePlan, path: &str, dry_run: bool) {
     println!("[OK      ] appended site block for `{}`", plan.rails_db_key);
 }
 
+fn create_digitalocean_dns_record(
+    plan: &SitePlan,
+    ip: &str,
+    token: &str,
+    dry_run: bool,
+) {
+    // For DO DNS, name should be just the left label, e.g. "swift-ember"
+    let name = &plan.slug;
+    let domain = plan.domain;
+
+    let body = json!({
+        "type": "A",
+        "name": name,
+        "data": ip,
+        "ttl": 3600
+    });
+
+    if dry_run {
+        println!(
+            "[DRY RUN] would create DO DNS record on domain `{}`: {}",
+            domain,
+            body
+        );
+        return;
+    }
+
+    println!(
+        "[RUN     ] creating DO DNS A record: {}.{} -> {}",
+        name, domain, ip
+    );
+
+    let client = Client::new();
+    let url = format!("https://api.digitalocean.com/v2/domains/{}/records", domain);
+
+    let resp = match client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[ERROR   ] failed to call DO API: {e}");
+            return;
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().unwrap_or_default();
+        eprintln!(
+            "[ERROR   ] DO DNS create failed: status={} body={}",
+            status, text
+        );
+        return;
+    }
+
+    println!("[OK      ] created DO DNS A record for {}.{}", name, domain);
+}
+
 #[derive(Parser)]
 #[command(name = "mrgarvey", version, about = "ofcourse multisite provisioner helper")]
 struct Cli {
@@ -145,6 +206,14 @@ enum Commands {
         #[arg(long, default_value = "multisite.yml")]
         multisite_path: String,
 
+        /// DigitalOcean API token (or set DO_API_TOKEN env)
+        #[arg(long, env = "DO_API_TOKEN")]
+        do_token: Option<String>,
+
+        /// Droplet IP for A records (or set DO_DROPLET_IP env)
+        #[arg(long, env = "DO_DROPLET_IP")]
+        do_ip: Option<String>,
+
         /// Print commands without executing them
         #[arg(long)]
         dry_run: bool,
@@ -162,16 +231,20 @@ fn main() {
             println!("{json}");
         }
 
-        Commands::New { domain, multisite_path, dry_run } => {
+        Commands::New {
+            domain,
+            multisite_path,
+            do_token,
+            do_ip,
+            dry_run,
+        } => {
             let slug = generate_slug();
             let plan = build_site_plan(&slug, &domain);
 
-            // Print the plan as JSON first
             let json = serde_json::to_string_pretty(&plan).expect("serialize plan");
             println!("{json}");
             println!();
 
-            // Build the commands we *would* run on the multisite host.
             let db_cmd = format!(
                 "docker exec app bash -lc \"sudo -u postgres createdb {db} && \
                  sudo -u postgres psql {db} <<EOF\n\
@@ -208,6 +281,15 @@ EOF\"",
 
             // 4) Restart unicorn
             run_step("restart_unicorn", &restart_cmd, dry_run);
+
+            // 5) Create DigitalOcean DNS record (if creds provided)
+            if let (Some(token), Some(ip)) = (do_token.as_deref(), do_ip.as_deref()) {
+                println!();
+                create_digitalocean_dns_record(&plan, ip, token, dry_run);
+            } else {
+                println!();
+                println!("[INFO    ] skipping DO DNS creation (no token or IP provided)");
+            }
         }
     }
 }
