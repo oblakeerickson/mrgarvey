@@ -117,6 +117,94 @@ fn update_multisite_file(plan: &SitePlan, path: &str, dry_run: bool) {
     println!("[OK      ] appended site block for `{}`", plan.rails_db_key);
 }
 
+fn update_caddyfile(plan: &SitePlan, path: &str, dry_run: bool) {
+    let path_obj = Path::new(path);
+    let contents = match fs::read_to_string(path_obj) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[ERROR   ] could not read Caddyfile {path}: {e}");
+            return;
+        }
+    };
+
+    let mut lines: Vec<String> = contents.lines().map(|l| l.to_string()).collect();
+    let mut changed = false;
+    let new_host = format!("{}.{}", plan.slug, plan.domain);
+
+    // Find the server block hosting Discourse (by reverse_proxy target)
+    for i in 0..lines.len() {
+        if lines[i].contains("reverse_proxy 127.0.0.1:8080") {
+            if i == 0 {
+                eprintln!("[ERROR   ] Caddyfile format unexpected (reverse_proxy on first line)");
+                break;
+            }
+
+            let host_line = &mut lines[i - 1];
+            // host line looks like: "multisite01.ofcourse.chat, try.ofcourse.chat, swift-ember.ofcourse.chat {"
+            let brace_pos = host_line.find('{').unwrap_or(host_line.len());
+            let (hosts_part, rest) = host_line.split_at(brace_pos);
+            let hosts_trimmed = hosts_part.trim_end();
+
+            if hosts_trimmed.contains(&new_host) {
+                println!("[INFO    ] Caddyfile already contains host `{}`; skipping.", new_host);
+                return;
+            }
+
+            let updated_hosts = if hosts_trimmed.is_empty() {
+                new_host.clone()
+            } else {
+                format!("{}, {}", hosts_trimmed, new_host)
+            };
+
+            let new_line = format!("{}{}", updated_hosts, rest);
+            if dry_run {
+                println!("[DRY RUN] would update Caddyfile host line:");
+                println!("  from: {}", host_line);
+                println!("  to:   {}", new_line);
+            } else {
+                println!("[RUN     ] updating Caddyfile host line:");
+                println!("  from: {}", host_line);
+                println!("  to:   {}", new_line);
+                *host_line = new_line;
+                changed = true;
+            }
+
+            break;
+        }
+    }
+
+    if !changed {
+        if !dry_run {
+            // changed = false also when host already existed or error; we already logged those
+        }
+        return;
+    }
+
+    if dry_run {
+        println!("[DRY RUN] would write updated Caddyfile to {path}");
+        return;
+    }
+
+    let new_contents = lines.join("\n");
+    if let Err(e) = fs::write(path_obj, new_contents) {
+        eprintln!("[ERROR   ] failed to write updated Caddyfile {path}: {e}");
+        return;
+    }
+
+    println!("[OK      ] updated Caddyfile {}", path);
+}
+
+fn reload_caddy(path: &str, dry_run: bool) {
+    let fmt_cmd = format!("caddy fmt --overwrite {path}");
+    let validate_cmd = format!("caddy validate --config {path}");
+    let reload_cmd = "systemctl reload caddy".to_string();
+
+    println!();
+    run_step("caddy_fmt", &fmt_cmd, dry_run);
+    run_step("caddy_validate", &validate_cmd, dry_run);
+    run_step("caddy_reload", &reload_cmd, dry_run);
+}
+
 fn create_digitalocean_dns_record(
     plan: &SitePlan,
     ip: &str,
@@ -215,6 +303,10 @@ enum Commands {
         #[arg(long, env = "DO_DROPLET_IP")]
         do_ip: Option<String>,
 
+        /// Path to Caddyfile
+        #[arg(long, default_value = "/etc/caddy/Caddyfile")]
+        caddy_path: String,
+
         /// Print commands without executing them
         #[arg(long)]
         dry_run: bool,
@@ -237,6 +329,7 @@ fn main() {
             multisite_path,
             do_token,
             do_ip,
+            caddy_path,
             dry_run,
         } => {
             let slug = generate_slug();
@@ -291,6 +384,11 @@ EOF\"",
                 println!();
                 println!("[INFO    ] skipping DO DNS creation (no token or IP provided)");
             }
+
+            // 6) Caddyfile update + reload
+            println!();
+            update_caddyfile(&plan, &caddy_path, dry_run);
+            reload_caddy(&caddy_path, dry_run);
         }
     }
 }
