@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use serde::Serialize;
+use serde_json::json;
 use reqwest::blocking::Client;
 
 const ADJECTIVES: &[&str] = &[
