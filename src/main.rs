@@ -117,7 +117,7 @@ fn update_multisite_file(plan: &SitePlan, path: &str, dry_run: bool) {
     println!("[OK      ] appended site block for `{}`", plan.rails_db_key);
 }
 
-fn update_caddyfile(plan: &SitePlan, path: &str, dry_run: bool) {
+fn update_caddyfile(plan: &SitePlan, path: &str, snippet: &str, dry_run: bool) {
     let path_obj = Path::new(path);
     let contents = match fs::read_to_string(path_obj) {
         Ok(c) => c,
@@ -127,65 +127,40 @@ fn update_caddyfile(plan: &SitePlan, path: &str, dry_run: bool) {
         }
     };
 
-    let mut lines: Vec<String> = contents.lines().map(|l| l.to_string()).collect();
-    let mut changed = false;
-    let new_host = format!("{}.{}", plan.slug, plan.domain);
+    let hostname = format!("{}.{}", plan.slug, plan.domain);
 
-    // Find the server block hosting Discourse (by reverse_proxy target)
-    for i in 0..lines.len() {
-        if lines[i].contains("reverse_proxy 127.0.0.1:8080") {
-            if i == 0 {
-                eprintln!("[ERROR   ] Caddyfile format unexpected (reverse_proxy on first line)");
-                break;
-            }
+    // If there's already a block for this host, bail early
+    let already_present = contents.lines().any(|line| {
+        // e.g. "calm-prairie.ofcourse.chat {" or with leading spaces
+        let trimmed = line.trim_start();
+        trimmed.starts_with(&hostname) && trimmed.contains('{')
+    });
 
-            let host_line = &mut lines[i - 1];
-            // host line looks like: "multisite01.ofcourse.chat, try.ofcourse.chat, swift-ember.ofcourse.chat {"
-            let brace_pos = host_line.find('{').unwrap_or(host_line.len());
-            let (hosts_part, rest) = host_line.split_at(brace_pos);
-            let hosts_trimmed = hosts_part.trim_end();
-
-            if hosts_trimmed.contains(&new_host) {
-                println!("[INFO    ] Caddyfile already contains host `{}`; skipping.", new_host);
-                return;
-            }
-
-            let updated_hosts = if hosts_trimmed.is_empty() {
-                new_host.clone()
-            } else {
-                format!("{}, {}", hosts_trimmed, new_host)
-            };
-
-            let new_line = format!("{}{}", updated_hosts, rest);
-            if dry_run {
-                println!("[DRY RUN] would update Caddyfile host line:");
-                println!("  from: {}", host_line);
-                println!("  to:   {}", new_line);
-            } else {
-                println!("[RUN     ] updating Caddyfile host line:");
-                println!("  from: {}", host_line);
-                println!("  to:   {}", new_line);
-                *host_line = new_line;
-                changed = true;
-            }
-
-            break;
-        }
-    }
-
-    if !changed {
-        if !dry_run {
-            // changed = false also when host already existed or error; we already logged those
-        }
+    if already_present {
+        println!("[INFO    ] Caddyfile already has a block for `{}`; skipping.", hostname);
         return;
     }
+
+    // Block we want to add, e.g.:
+    // calm-prairie.ofcourse.chat {
+    //     import discourse_site
+    // }
+    let block = format!(
+        "\n\n{host} {{\n    import {snippet}\n}}\n",
+        host = hostname,
+        snippet = snippet,
+    );
 
     if dry_run {
-        println!("[DRY RUN] would write updated Caddyfile to {path}");
+        println!("[DRY RUN] would append to Caddyfile {path}:\n{block}");
         return;
     }
 
-    let new_contents = lines.join("\n");
+    println!("[RUN     ] appending new Caddy block for `{}` to {}", hostname, path);
+
+    let mut new_contents = contents;
+    new_contents.push_str(&block);
+
     if let Err(e) = fs::write(path_obj, new_contents) {
         eprintln!("[ERROR   ] failed to write updated Caddyfile {path}: {e}");
         return;
@@ -307,6 +282,10 @@ enum Commands {
         #[arg(long, default_value = "/etc/caddy/Caddyfile")]
         caddy_path: String,
 
+        /// Caddy snippet name to import (e.g. discourse_site)
+        #[arg(long, default_value = "discourse_site")]
+        caddy_snippet: String,
+
         /// Print commands without executing them
         #[arg(long)]
         dry_run: bool,
@@ -330,6 +309,7 @@ fn main() {
             do_token,
             do_ip,
             caddy_path,
+            caddy_snippet,
             dry_run,
         } => {
             let slug = generate_slug();
@@ -387,7 +367,7 @@ EOF\"",
 
             // 6) Caddyfile update + reload
             println!();
-            update_caddyfile(&plan, &caddy_path, dry_run);
+            update_caddyfile(&plan, &caddy_path, &caddy_snippet, dry_run);
             reload_caddy(&caddy_path, dry_run);
         }
     }
