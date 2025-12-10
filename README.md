@@ -1,5 +1,7 @@
 # mrgarvey
 
+![mrgarvey](https://github.com/user-attachments/assets/5b3cbf8d-c14c-47d1-976c-8d0207d008ab)
+
 A CLI tool for provisioning new Discourse multisite instances on the "ofcourse.chat" platform (or any custom domain). It automates the tedious steps of spinning up a new site in a Discourse multisite deployment.
 
 ## Features
