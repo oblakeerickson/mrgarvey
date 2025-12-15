@@ -13,7 +13,7 @@ A CLI tool for provisioning new Discourse multisite instances on the "ofcourse.c
 | **PostgreSQL database creation** | Creates a new Postgres database inside the Docker container with required extensions (`hstore`, `pg_trgm`) and grants |
 | **multisite.yml management** | Appends a new site block to the Discourse multisite YAML config (idempotent—skips if already present) |
 | **Rails migrations** | Runs `db:migrate` and `db:seed_fu` for the new site via Docker |
-| **Admin user creation** | Creates an admin user via `rake admin:create` with a random password; credentials are printed to console |
+| **Site claiming API** | REST API endpoint to claim a pre-provisioned site, create admin user, and send password reset email |
 | **Unicorn restart** | Restarts the Discourse app server to pick up the new site |
 | **DigitalOcean DNS** | Creates an A record via the DO API pointing the new subdomain to your droplet IP |
 | **Caddyfile management** | Appends a reverse-proxy block for the new hostname and reloads Caddy |
@@ -22,7 +22,37 @@ A CLI tool for provisioning new Discourse multisite instances on the "ofcourse.c
 ## Commands
 
 - **`mrgarvey plan`** — Print a site plan as JSON (optionally specify `--slug` or let it generate one)
-- **`mrgarvey new`** — Provision a complete new site: DB, config, migrations, DNS, and web server
+- **`mrgarvey new`** — Pre-provision a new site: DB, config, migrations, DNS, and web server (no admin user yet)
+- **`mrgarvey serve`** — Run the API server for claiming pre-provisioned sites
+  - Use `--bind=private` to auto-detect and bind to the DigitalOcean private IP
+  - Use `--port=8080` to specify the port (default: 8080)
+
+## API Endpoints
+
+### POST /claim
+
+Claim an available pre-provisioned site and create an admin user.
+
+**Request:**
+```json
+{
+  "email": "admin@example.com"
+}
+```
+
+**Response:**
+```json
+{
+  "hostname": "swift-ember.ofcourse.chat",
+  "email": "admin@example.com"
+}
+```
+
+The endpoint will:
+1. Find an unclaimed site (one without any admin users)
+2. Create an admin user with the provided email
+3. Trigger a password reset email so the user can set their password
+4. Return the site hostname
 
 ## Environment Variables
 
