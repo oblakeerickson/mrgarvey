@@ -5,8 +5,9 @@ use std::io::Write;
 use std::path::Path;
 
 use clap::{Parser, Subcommand};
+use rand::distributions::Alphanumeric;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
+use rand::{thread_rng, Rng};
 use serde::Serialize;
 use serde_json::json;
 use reqwest::blocking::Client;
@@ -18,6 +19,14 @@ const ADJECTIVES: &[&str] = &[
 const NOUNS: &[&str] = &[
     "honey", "river", "maple", "pine", "sparrow", "aurora", "prairie", "summit", "ember", "canyon",
 ];
+
+fn generate_password() -> String {
+    thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(24)
+        .map(char::from)
+        .collect()
+}
 
 #[derive(Serialize)]
 struct SitePlan<'a> {
@@ -353,10 +362,33 @@ EOF\"",
             // 3) Migrate & seed
             run_step("migrate_and_seed", &migrate_cmd, dry_run);
 
-            // 4) Restart unicorn
+            // 4) Create admin user
+            // TODO: Get email from API call instead of hardcoded value
+            let admin_email = "blake@blake.app";
+            let admin_password = generate_password();
+            let admin_cmd = [
+                "docker exec app bash -lc \"",
+                "cd /var/www/discourse && ",
+                &format!("RAILS_DB={} ", plan.rails_db_key),
+                "sudo -E -u discourse bundle exec rake admin:create <<-EOF\n",
+                &format!("{admin_email}\n"),
+                &format!("{admin_password}\n"),
+                &format!("{admin_password}\n"),
+                "Y\n",
+                "EOF\"",
+            ]
+            .concat();
+
+            run_step("create_admin", &admin_cmd, dry_run);
+
+            println!();
+            println!("[INFO    ] Admin user created: {}", admin_email);
+            println!("           (Use password reset to set your own password)");
+
+            // 5) Restart unicorn
             run_step("restart_unicorn", &restart_cmd, dry_run);
 
-            // 5) Create DigitalOcean DNS record (if creds provided)
+            // 6) Create DigitalOcean DNS record (if creds provided)
             if let (Some(token), Some(ip)) = (do_token.as_deref(), do_ip.as_deref()) {
                 println!();
                 create_digitalocean_dns_record(&plan, ip, token, dry_run);
@@ -365,7 +397,7 @@ EOF\"",
                 println!("[INFO    ] skipping DO DNS creation (no token or IP provided)");
             }
 
-            // 6) Caddyfile update + reload
+            // 7) Caddyfile update + reload
             println!();
             update_caddyfile(&plan, &caddy_path, &caddy_snippet, dry_run);
             reload_caddy(&caddy_path, dry_run);

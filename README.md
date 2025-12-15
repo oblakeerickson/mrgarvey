@@ -13,6 +13,7 @@ A CLI tool for provisioning new Discourse multisite instances on the "ofcourse.c
 | **PostgreSQL database creation** | Creates a new Postgres database inside the Docker container with required extensions (`hstore`, `pg_trgm`) and grants |
 | **multisite.yml management** | Appends a new site block to the Discourse multisite YAML config (idempotent—skips if already present) |
 | **Rails migrations** | Runs `db:migrate` and `db:seed_fu` for the new site via Docker |
+| **Admin user creation** | Creates an admin user via `rake admin:create` with a random password; credentials are printed to console |
 | **Unicorn restart** | Restarts the Discourse app server to pick up the new site |
 | **DigitalOcean DNS** | Creates an A record via the DO API pointing the new subdomain to your droplet IP |
 | **Caddyfile management** | Appends a reverse-proxy block for the new hostname and reloads Caddy |
