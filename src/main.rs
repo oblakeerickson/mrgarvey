@@ -325,6 +325,17 @@ enum Commands {
         #[arg(long, default_value = "ofcourse.chat")]
         domain: String,
     },
+
+    /// Check how many pre-provisioned sites are available
+    Status {
+        /// Path to multisite.yml
+        #[arg(long, default_value = "/var/discourse/shared/standalone/config/multisite.yml")]
+        multisite_path: String,
+
+        /// Base domain (default: ofcourse.chat)
+        #[arg(long, default_value = "ofcourse.chat")]
+        domain: String,
+    },
 }
 
 /// Shared context for the API server
@@ -382,12 +393,8 @@ struct SiteInfo {
     hostname: String,
 }
 
-/// Parse multisite.yml and find a site without an admin user
-fn find_unclaimed_site(multisite_path: &str, domain: &str) -> Result<SiteInfo, HttpError> {
-    let contents = fs::read_to_string(multisite_path).map_err(|e| {
-        HttpError::for_internal_error(format!("failed to read multisite.yml: {e}"))
-    })?;
-
+/// Parse multisite.yml and return all sites
+fn parse_multisite_yaml(contents: &str, domain: &str) -> Vec<SiteInfo> {
     // Parse the YAML to find all site keys
     // Format is:
     // site_key:
@@ -433,6 +440,17 @@ fn find_unclaimed_site(multisite_path: &str, domain: &str) -> Result<SiteInfo, H
         });
     }
 
+    sites
+}
+
+/// Parse multisite.yml and find a site without an admin user
+fn find_unclaimed_site(multisite_path: &str, domain: &str) -> Result<SiteInfo, HttpError> {
+    let contents = fs::read_to_string(multisite_path).map_err(|e| {
+        HttpError::for_internal_error(format!("failed to read multisite.yml: {e}"))
+    })?;
+
+    let sites = parse_multisite_yaml(&contents, domain);
+
     // Check each site for admin users
     for site in sites {
         if !site_has_admin(&site.rails_db_key)? {
@@ -444,6 +462,45 @@ fn find_unclaimed_site(multisite_path: &str, domain: &str) -> Result<SiteInfo, H
         None,
         "no unclaimed sites available".to_string(),
     ))
+}
+
+/// Get status of all sites: (total, claimed, unclaimed)
+fn get_site_status(multisite_path: &str, domain: &str) -> Result<(usize, usize, usize), String> {
+    let contents = fs::read_to_string(multisite_path)
+        .map_err(|e| format!("failed to read multisite.yml: {e}"))?;
+
+    let sites = parse_multisite_yaml(&contents, domain);
+    let total = sites.len();
+    let mut claimed = 0;
+
+    for site in &sites {
+        match site_has_admin_simple(&site.rails_db_key) {
+            Ok(true) => claimed += 1,
+            Ok(false) => {}
+            Err(e) => eprintln!("[WARN    ] failed to check {}: {}", site.hostname, e),
+        }
+    }
+
+    Ok((total, claimed, total - claimed))
+}
+
+/// Check if a site has admin users (simple version for status command)
+fn site_has_admin_simple(rails_db_key: &str) -> Result<bool, String> {
+    let cmd = format!(
+        r#"docker exec app bash -lc "cd /var/www/discourse && RAILS_DB={} sudo -E -u discourse bundle exec rails runner 'puts User.where(admin: true).count'""#,
+        rails_db_key
+    );
+
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .output()
+        .map_err(|e| format!("failed to run command: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let count: i32 = stdout.trim().parse().unwrap_or(0);
+
+    Ok(count > 0)
 }
 
 /// Check if a site has any admin users
@@ -626,6 +683,28 @@ EOF\"",
             rt.block_on(async {
                 run_server(&bind_addr, multisite_path, domain).await.expect("server failed");
             });
+        }
+
+        Commands::Status {
+            multisite_path,
+            domain,
+        } => {
+            match get_site_status(&multisite_path, &domain) {
+                Ok((total, claimed, unclaimed)) => {
+                    println!("Site Status:");
+                    println!("  Total sites:     {}", total);
+                    println!("  Claimed:         {}", claimed);
+                    println!("  Unclaimed:       {}", unclaimed);
+                    if unclaimed == 0 {
+                        println!();
+                        println!("⚠️  No unclaimed sites available. Run `mrgarvey new` to provision more.");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[ERROR   ] {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

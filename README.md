@@ -26,6 +26,7 @@ A CLI tool for provisioning new Discourse multisite instances on the "ofcourse.c
 - **`mrgarvey serve`** — Run the API server for claiming pre-provisioned sites
   - Use `--bind=private` to auto-detect and bind to the DigitalOcean private IP
   - Use `--port=8080` to specify the port (default: 8080)
+- **`mrgarvey status`** — Check how many pre-provisioned sites are available
 
 ## API Endpoints
 
