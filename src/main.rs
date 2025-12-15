@@ -376,17 +376,27 @@ async fn claim_site(
         HttpError::for_not_found(None, "no unclaimed sites available".to_string())
     })?;
 
-    // Create admin user
-    create_admin_user(&unclaimed.rails_db_key, &req.email)?;
-
-    // Trigger password reset email
-    trigger_password_reset(&unclaimed.hostname, &req.email)?;
-
-    // Mark as claimed in cache
+    // Mark as claimed in cache immediately
     cache.claim_site(&unclaimed.rails_db_key);
     if let Err(e) = cache.save() {
         eprintln!("[WARN    ] failed to update cache: {}", e);
     }
+
+    // Clone values for the background task
+    let rails_db_key = unclaimed.rails_db_key.clone();
+    let hostname = unclaimed.hostname.clone();
+    let email = req.email.clone();
+
+    // Spawn background task for admin creation and password reset
+    std::thread::spawn(move || {
+        if let Err(e) = create_admin_user_sync(&rails_db_key, &email) {
+            eprintln!("[ERROR   ] failed to create admin: {}", e);
+            return;
+        }
+        if let Err(e) = trigger_password_reset_sync(&hostname, &email) {
+            eprintln!("[WARN    ] failed to trigger password reset: {}", e);
+        }
+    });
 
     Ok(HttpResponseOk(ClaimResponse {
         hostname: unclaimed.hostname,
@@ -460,8 +470,8 @@ impl SiteCache {
     }
 }
 
-/// Create an admin user for a site
-fn create_admin_user(rails_db_key: &str, email: &str) -> Result<(), HttpError> {
+/// Create an admin user for a site (sync version for background thread)
+fn create_admin_user_sync(rails_db_key: &str, email: &str) -> Result<(), String> {
     let password = generate_password();
     let admin_cmd = [
         "docker exec app bash -lc \"",
@@ -480,38 +490,60 @@ fn create_admin_user(rails_db_key: &str, email: &str) -> Result<(), HttpError> {
         .arg("-c")
         .arg(&admin_cmd)
         .status()
-        .map_err(|e| HttpError::for_internal_error(format!("failed to create admin: {e}")))?;
+        .map_err(|e| format!("failed to create admin: {e}"))?;
 
     if !status.success() {
-        return Err(HttpError::for_internal_error(
-            "admin creation command failed".to_string(),
-        ));
+        return Err("admin creation command failed".to_string());
     }
 
+    println!("[OK      ] admin user created for {}", email);
     Ok(())
 }
 
-/// Trigger a password reset email for the user
-fn trigger_password_reset(hostname: &str, email: &str) -> Result<(), HttpError> {
-    let url = format!("https://{}/session/forgot_password", hostname);
+/// Trigger a password reset email via Rails console (avoids CSRF issues)
+fn trigger_password_reset_sync(hostname: &str, email: &str) -> Result<(), String> {
+    // Extract rails_db_key from hostname (e.g., "swift-ember.ofcourse.chat" -> "swift_ember_discourse")
+    let subdomain = hostname.split('.').next().unwrap_or(hostname);
+    let rails_db_key = format!("{}_discourse", subdomain.replace('-', "_"));
 
-    let client = Client::new();
-    let resp = client
-        .post(&url)
-        .header("Content-Type", "application/x-www-form-urlencoded")
-        .body(format!("login={}", email))
-        .send()
-        .map_err(|e| HttpError::for_internal_error(format!("failed to trigger password reset: {e}")))?;
+    let ruby_code = [
+        &format!("user = User.find_by_email('{}'); ", email),
+        "if user; ",
+        "email_token = user.email_tokens.create!(",
+        "email: user.email, ",
+        "scope: EmailToken.scopes[:password_reset]",
+        "); ",
+        "Jobs.enqueue(",
+        ":critical_user_email, ",
+        "type: 'forgot_password', ",
+        "user_id: user.id, ",
+        "email_token: email_token.token",
+        "); ",
+        "end",
+    ]
+    .concat();
 
-    if !resp.status().is_success() {
-        // Log but don't fail - the admin was created, they can reset manually
-        eprintln!(
-            "[WARN    ] password reset request returned {}: {}",
-            resp.status(),
-            resp.text().unwrap_or_default()
-        );
+    let cmd = [
+        "docker exec app bash -lc \"",
+        "cd /var/www/discourse && ",
+        &format!("RAILS_DB={} ", rails_db_key),
+        "sudo -E -u discourse bundle exec rails runner \\\"",
+        &ruby_code,
+        "\\\"\"",
+    ]
+    .concat();
+
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .status()
+        .map_err(|e| format!("failed to trigger password reset: {e}"))?;
+
+    if !status.success() {
+        return Err("password reset command failed".to_string());
     }
 
+    println!("[OK      ] password reset email sent to {}", email);
     Ok(())
 }
 
