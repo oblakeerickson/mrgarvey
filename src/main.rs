@@ -23,6 +23,8 @@ const ADJECTIVES: &[&str] = &[
     "fancy", "bright", "quiet", "lucky", "golden", "rusty", "brave", "clever", "calm", "swift",
 ];
 
+const CACHE_FILE: &str = "/var/mrgarvey/sites.json";
+
 const NOUNS: &[&str] = &[
     "honey", "river", "maple", "pine", "sparrow", "aurora", "prairie", "summit", "ember", "canyon",
 ];
@@ -338,11 +340,8 @@ enum Commands {
     },
 }
 
-/// Shared context for the API server
-struct ApiContext {
-    multisite_path: String,
-    domain: String,
-}
+/// Shared context for the API server (empty for now, cache is file-based)
+struct ApiContext;
 
 /// Request body for claiming a site
 #[derive(Deserialize, JsonSchema)]
@@ -366,14 +365,16 @@ struct ClaimResponse {
     path = "/claim",
 }]
 async fn claim_site(
-    rqctx: RequestContext<Arc<ApiContext>>,
+    _rqctx: RequestContext<Arc<ApiContext>>,
     body: TypedBody<ClaimRequest>,
 ) -> Result<HttpResponseOk<ClaimResponse>, HttpError> {
-    let ctx = rqctx.context();
     let req = body.into_inner();
 
-    // Find an unclaimed site (one without an admin user)
-    let unclaimed = find_unclaimed_site(&ctx.multisite_path, &ctx.domain)?;
+    // Load cache and find an unclaimed site
+    let mut cache = SiteCache::load();
+    let unclaimed = cache.find_unclaimed().cloned().ok_or_else(|| {
+        HttpError::for_not_found(None, "no unclaimed sites available".to_string())
+    })?;
 
     // Create admin user
     create_admin_user(&unclaimed.rails_db_key, &req.email)?;
@@ -381,149 +382,82 @@ async fn claim_site(
     // Trigger password reset email
     trigger_password_reset(&unclaimed.hostname, &req.email)?;
 
+    // Mark as claimed in cache
+    cache.claim_site(&unclaimed.rails_db_key);
+    if let Err(e) = cache.save() {
+        eprintln!("[WARN    ] failed to update cache: {}", e);
+    }
+
     Ok(HttpResponseOk(ClaimResponse {
         hostname: unclaimed.hostname,
         email: req.email,
     }))
 }
 
-/// Site info parsed from multisite.yml
-struct SiteInfo {
+/// Cached site entry
+#[derive(Serialize, Deserialize, Clone)]
+struct CachedSite {
     rails_db_key: String,
     hostname: String,
+    claimed: bool,
 }
 
-/// Parse multisite.yml and return all sites
-fn parse_multisite_yaml(contents: &str, domain: &str) -> Vec<SiteInfo> {
-    // Parse the YAML to find all site keys
-    // Format is:
-    // site_key:
-    //   adapter: postgresql
-    //   database: site_key
-    //   host_names:
-    //     - "slug.domain"
-    let mut sites: Vec<SiteInfo> = Vec::new();
-    let mut current_key: Option<String> = None;
-    let mut current_hostname: Option<String> = None;
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-
-        // Top-level key (no leading whitespace, ends with :)
-        if !line.starts_with(' ') && !line.starts_with('\t') && trimmed.ends_with(':') {
-            // Save previous site if complete
-            if let (Some(key), Some(host)) = (current_key.take(), current_hostname.take()) {
-                sites.push(SiteInfo {
-                    rails_db_key: key,
-                    hostname: host,
-                });
-            }
-            current_key = Some(trimmed.trim_end_matches(':').to_string());
-            current_hostname = None;
-        }
-
-        // hostname line: - "slug.domain"
-        if trimmed.starts_with("- \"") && trimmed.ends_with('"') && trimmed.contains(domain) {
-            let host = trimmed
-                .trim_start_matches("- \"")
-                .trim_end_matches('"')
-                .to_string();
-            current_hostname = Some(host);
-        }
-    }
-
-    // Don't forget the last site
-    if let (Some(key), Some(host)) = (current_key, current_hostname) {
-        sites.push(SiteInfo {
-            rails_db_key: key,
-            hostname: host,
-        });
-    }
-
-    sites
+/// Site cache file structure
+#[derive(Serialize, Deserialize, Default)]
+struct SiteCache {
+    sites: Vec<CachedSite>,
 }
 
-/// Parse multisite.yml and find a site without an admin user
-fn find_unclaimed_site(multisite_path: &str, domain: &str) -> Result<SiteInfo, HttpError> {
-    let contents = fs::read_to_string(multisite_path).map_err(|e| {
-        HttpError::for_internal_error(format!("failed to read multisite.yml: {e}"))
-    })?;
+impl SiteCache {
+    fn load() -> Self {
+        fs::read_to_string(CACHE_FILE)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
 
-    let sites = parse_multisite_yaml(&contents, domain);
+    fn save(&self) -> Result<(), String> {
+        // Ensure directory exists
+        if let Some(parent) = Path::new(CACHE_FILE).parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create cache directory: {e}"))?;
+        }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("failed to serialize cache: {e}"))?;
+        fs::write(CACHE_FILE, json)
+            .map_err(|e| format!("failed to write cache: {e}"))?;
+        Ok(())
+    }
 
-    // Check each site for admin users
-    for site in sites {
-        if !site_has_admin(&site.rails_db_key)? {
-            return Ok(site);
+    fn add_site(&mut self, rails_db_key: String, hostname: String) {
+        // Don't add duplicates
+        if !self.sites.iter().any(|s| s.rails_db_key == rails_db_key) {
+            self.sites.push(CachedSite {
+                rails_db_key,
+                hostname,
+                claimed: false,
+            });
         }
     }
 
-    Err(HttpError::for_not_found(
-        None,
-        "no unclaimed sites available".to_string(),
-    ))
-}
-
-/// Get status of all sites: (total, claimed, unclaimed)
-fn get_site_status(multisite_path: &str, domain: &str) -> Result<(usize, usize, usize), String> {
-    let contents = fs::read_to_string(multisite_path)
-        .map_err(|e| format!("failed to read multisite.yml: {e}"))?;
-
-    let sites = parse_multisite_yaml(&contents, domain);
-    let total = sites.len();
-    let mut claimed = 0;
-
-    for site in &sites {
-        match site_has_admin_simple(&site.rails_db_key) {
-            Ok(true) => claimed += 1,
-            Ok(false) => {}
-            Err(e) => eprintln!("[WARN    ] failed to check {}: {}", site.hostname, e),
+    fn claim_site(&mut self, rails_db_key: &str) -> bool {
+        if let Some(site) = self.sites.iter_mut().find(|s| s.rails_db_key == rails_db_key) {
+            site.claimed = true;
+            true
+        } else {
+            false
         }
     }
 
-    Ok((total, claimed, total - claimed))
-}
+    fn find_unclaimed(&self) -> Option<&CachedSite> {
+        self.sites.iter().find(|s| !s.claimed)
+    }
 
-/// Check if a site has admin users (simple version for status command)
-fn site_has_admin_simple(rails_db_key: &str) -> Result<bool, String> {
-    let cmd = format!(
-        r#"docker exec app bash -lc "cd /var/www/discourse && RAILS_DB={} sudo -E -u discourse bundle exec rails runner 'puts User.where(admin: true).count'""#,
-        rails_db_key
-    );
-
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .output()
-        .map_err(|e| format!("failed to run command: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let count: i32 = stdout.trim().parse().unwrap_or(0);
-
-    Ok(count > 0)
-}
-
-/// Check if a site has any admin users
-fn site_has_admin(rails_db_key: &str) -> Result<bool, HttpError> {
-    // Query the database for admin users
-    let cmd = format!(
-        r#"docker exec app bash -lc "cd /var/www/discourse && RAILS_DB={} sudo -E -u discourse bundle exec rails runner 'puts User.where(admin: true).count'""#,
-        rails_db_key
-    );
-
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .output()
-        .map_err(|e| HttpError::for_internal_error(format!("failed to check admin users: {e}")))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let count: i32 = stdout
-        .trim()
-        .parse()
-        .unwrap_or(0);
-
-    Ok(count > 0)
+    fn stats(&self) -> (usize, usize, usize) {
+        let total = self.sites.len();
+        let claimed = self.sites.iter().filter(|s| s.claimed).count();
+        (total, claimed, total - claimed)
+    }
 }
 
 /// Create an admin user for a site
@@ -659,6 +593,15 @@ EOF\"",
             update_caddyfile(&plan, &caddy_path, &caddy_snippet, dry_run);
             reload_caddy(&caddy_path, dry_run);
 
+            // Add to cache (unless dry run)
+            if !dry_run {
+                let mut cache = SiteCache::load();
+                cache.add_site(plan.rails_db_key.clone(), plan.hostname.clone());
+                if let Err(e) = cache.save() {
+                    eprintln!("[WARN    ] failed to update cache: {}", e);
+                }
+            }
+
             println!();
             println!("[INFO    ] Site pre-provisioned (no admin user yet)");
             println!("           Use `mrgarvey serve` and POST /claim to assign an admin");
@@ -667,8 +610,8 @@ EOF\"",
         Commands::Serve {
             bind,
             port,
-            multisite_path,
-            domain,
+            multisite_path: _,
+            domain: _,
         } => {
             // Resolve bind address (support "private" for DO private IP)
             let bind_addr = if bind == "private" {
@@ -681,29 +624,28 @@ EOF\"",
             // Run the async server
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             rt.block_on(async {
-                run_server(&bind_addr, multisite_path, domain).await.expect("server failed");
+                run_server(&bind_addr).await.expect("server failed");
             });
         }
 
         Commands::Status {
-            multisite_path,
-            domain,
+            multisite_path: _,
+            domain: _,
         } => {
-            match get_site_status(&multisite_path, &domain) {
-                Ok((total, claimed, unclaimed)) => {
-                    println!("Site Status:");
-                    println!("  Total sites:     {}", total);
-                    println!("  Claimed:         {}", claimed);
-                    println!("  Unclaimed:       {}", unclaimed);
-                    if unclaimed == 0 {
-                        println!();
-                        println!("⚠️  No unclaimed sites available. Run `mrgarvey new` to provision more.");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[ERROR   ] {}", e);
-                    std::process::exit(1);
-                }
+            let cache = SiteCache::load();
+            let (total, claimed, unclaimed) = cache.stats();
+
+            println!("Site Status (from cache):");
+            println!("  Total sites:     {}", total);
+            println!("  Claimed:         {}", claimed);
+            println!("  Unclaimed:       {}", unclaimed);
+
+            if total == 0 {
+                println!();
+                println!("⚠️  Cache is empty. Run `mrgarvey new` to provision sites.");
+            } else if unclaimed == 0 {
+                println!();
+                println!("⚠️  No unclaimed sites available. Run `mrgarvey new` to provision more.");
             }
         }
     }
@@ -726,7 +668,7 @@ fn get_do_private_ip() -> Result<String, String> {
     Ok(ip.trim().to_string())
 }
 
-async fn run_server(bind: &str, multisite_path: String, domain: String) -> Result<(), String> {
+async fn run_server(bind: &str) -> Result<(), String> {
     let log = ConfigLogging::StderrTerminal {
         level: ConfigLoggingLevel::Info,
     }
@@ -736,10 +678,7 @@ async fn run_server(bind: &str, multisite_path: String, domain: String) -> Resul
     let mut api = ApiDescription::new();
     api.register(claim_site).expect("failed to register claim_site endpoint");
 
-    let ctx = Arc::new(ApiContext {
-        multisite_path,
-        domain,
-    });
+    let ctx = Arc::new(ApiContext);
 
     let addr: SocketAddr = bind.parse().map_err(|e| format!("invalid bind address: {e}"))?;
 
