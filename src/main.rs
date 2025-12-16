@@ -284,8 +284,8 @@ enum Commands {
         #[arg(long, default_value = "ofcourse.chat")]
         domain: String,
 
-        /// Path to multisite.yml (local dev default; on server you'll point to the real file)
-        #[arg(long, default_value = "multisite.yml")]
+        /// Path to multisite.yml
+        #[arg(long, default_value = "/var/discourse/shared/standalone/config/multisite.yml")]
         multisite_path: String,
 
         /// DigitalOcean API token (or set DO_API_TOKEN env)
@@ -354,7 +354,7 @@ enum Commands {
         domain: String,
 
         /// Path to multisite.yml
-        #[arg(long, default_value = "multisite.yml")]
+        #[arg(long, default_value = "/var/discourse/shared/standalone/config/multisite.yml")]
         multisite_path: String,
 
         /// DigitalOcean API token (or set DO_API_TOKEN env)
@@ -640,11 +640,11 @@ EOF\"",
             println!();
             update_multisite_file(&plan, &multisite_path, dry_run);
 
-            // 3) Migrate & seed
-            run_step("migrate_and_seed", &migrate_cmd, dry_run);
-
-            // 4) Restart unicorn
+            // 3) Restart unicorn (so it picks up the new site from multisite.yml)
             run_step("restart_unicorn", &restart_cmd, dry_run);
+
+            // 4) Migrate & seed (must happen after unicorn knows about the site)
+            run_step("migrate_and_seed", &migrate_cmd, dry_run);
 
             // 5) Create DigitalOcean DNS record (if creds provided)
             if let (Some(token), Some(ip)) = (do_token.as_deref(), do_ip.as_deref()) {
@@ -848,11 +848,11 @@ EOF\"",
     // 2) Update multisite.yml
     update_multisite_file(&plan, multisite_path, false);
 
-    // 3) Migrate & seed
-    run_step("migrate_and_seed", &migrate_cmd, false);
-
-    // 4) Restart unicorn
+    // 3) Restart unicorn (so it picks up the new site from multisite.yml)
     run_step("restart_unicorn", &restart_cmd, false);
+
+    // 4) Migrate & seed (must happen after unicorn knows about the site)
+    run_step("migrate_and_seed", &migrate_cmd, false);
 
     // 5) Create DigitalOcean DNS record (if creds provided)
     if let (Some(token), Some(ip)) = (do_token, do_ip) {
