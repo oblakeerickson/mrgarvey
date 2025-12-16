@@ -383,6 +383,10 @@ struct ApiContext;
 struct ClaimRequest {
     /// Email address for the admin user
     email: String,
+    /// Community name (site title)
+    site_name: String,
+    /// Username for the admin user
+    username: String,
 }
 
 /// Response body after claiming a site
@@ -421,10 +425,15 @@ async fn claim_site(
     let rails_db_key = unclaimed.rails_db_key.clone();
     let hostname = unclaimed.hostname.clone();
     let email = req.email.clone();
+    let site_name = req.site_name.clone();
+    let username = req.username.clone();
 
-    // Spawn background task for admin creation and password reset
+    // Spawn background task for site setup, admin creation, and password reset
     std::thread::spawn(move || {
-        if let Err(e) = create_admin_user_sync(&rails_db_key, &email) {
+        if let Err(e) = configure_site_sync(&rails_db_key, &site_name) {
+            eprintln!("[ERROR   ] failed to configure site: {}", e);
+        }
+        if let Err(e) = create_admin_user_sync(&rails_db_key, &email, &username) {
             eprintln!("[ERROR   ] failed to create admin: {}", e);
             return;
         }
@@ -505,8 +514,40 @@ impl SiteCache {
     }
 }
 
+/// Configure site settings (title, disable wizard)
+fn configure_site_sync(rails_db_key: &str, name: &str) -> Result<(), String> {
+    let ruby_code = [
+        &format!("SiteSetting.title = '{}'; ", name.replace('\'', "\\'")),
+        "SiteSetting.wizard_enabled = false",
+    ]
+    .concat();
+
+    let cmd = [
+        "docker exec app bash -lc \"",
+        "cd /var/www/discourse && ",
+        &format!("RAILS_DB={} ", rails_db_key),
+        "sudo -E -u discourse bundle exec rails runner \\\"",
+        &ruby_code,
+        "\\\"\"",
+    ]
+    .concat();
+
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .status()
+        .map_err(|e| format!("failed to configure site: {e}"))?;
+
+    if !status.success() {
+        return Err("site configuration command failed".to_string());
+    }
+
+    println!("[OK      ] site configured: title='{}', wizard disabled", name);
+    Ok(())
+}
+
 /// Create an admin user for a site (sync version for background thread)
-fn create_admin_user_sync(rails_db_key: &str, email: &str) -> Result<(), String> {
+fn create_admin_user_sync(rails_db_key: &str, email: &str, username: &str) -> Result<(), String> {
     let password = generate_password();
     let admin_cmd = [
         "docker exec app bash -lc \"",
@@ -531,7 +572,34 @@ fn create_admin_user_sync(rails_db_key: &str, email: &str) -> Result<(), String>
         return Err("admin creation command failed".to_string());
     }
 
-    println!("[OK      ] admin user created for {}", email);
+    // Update the username (rake admin:create generates a default one)
+    let ruby_code = format!(
+        "user = User.find_by_email('{}'); user.update!(username: '{}') if user",
+        email,
+        username.replace('\'', "\\'")
+    );
+
+    let update_cmd = [
+        "docker exec app bash -lc \"",
+        "cd /var/www/discourse && ",
+        &format!("RAILS_DB={} ", rails_db_key),
+        "sudo -E -u discourse bundle exec rails runner \\\"",
+        &ruby_code,
+        "\\\"\"",
+    ]
+    .concat();
+
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(&update_cmd)
+        .status()
+        .map_err(|e| format!("failed to update username: {e}"))?;
+
+    if !status.success() {
+        eprintln!("[WARN    ] failed to update username to {}", username);
+    }
+
+    println!("[OK      ] admin user created: {} ({})", username, email);
     Ok(())
 }
 
