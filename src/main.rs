@@ -616,12 +616,10 @@ fn trigger_password_reset_sync(hostname: &str, email: &str) -> Result<(), String
         "email: user.email, ",
         "scope: EmailToken.scopes[:password_reset]",
         "); ",
-        "Jobs.enqueue(",
-        ":critical_user_email, ",
-        "type: 'forgot_password', ",
-        "user_id: user.id, ",
+        "UserNotifications.forgot_password(",
+        "user, ",
         "email_token: email_token.token",
-        "); ",
+        ").deliver_now; ",
         "end",
     ]
     .concat();
