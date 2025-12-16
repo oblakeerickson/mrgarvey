@@ -338,6 +338,41 @@ enum Commands {
         #[arg(long, default_value = "ofcourse.chat")]
         domain: String,
     },
+
+    /// Keep the pool of pre-provisioned sites topped up (runs continuously)
+    Attendance {
+        /// Minimum number of unclaimed sites to maintain
+        #[arg(long, default_value = "5")]
+        min_unclaimed: usize,
+
+        /// Seconds to wait between checks
+        #[arg(long, default_value = "60")]
+        interval: u64,
+
+        /// Base domain (default: ofcourse.chat)
+        #[arg(long, default_value = "ofcourse.chat")]
+        domain: String,
+
+        /// Path to multisite.yml
+        #[arg(long, default_value = "multisite.yml")]
+        multisite_path: String,
+
+        /// DigitalOcean API token (or set DO_API_TOKEN env)
+        #[arg(long, env = "DO_API_TOKEN")]
+        do_token: Option<String>,
+
+        /// Droplet IP for A records (or set DO_DROPLET_IP env)
+        #[arg(long, env = "DO_DROPLET_IP")]
+        do_ip: Option<String>,
+
+        /// Path to Caddyfile
+        #[arg(long, default_value = "/etc/caddy/Caddyfile")]
+        caddy_path: String,
+
+        /// Caddy snippet name to import
+        #[arg(long, default_value = "discourse_site")]
+        caddy_snippet: String,
+    },
 }
 
 /// Shared context for the API server (empty for now, cache is file-based)
@@ -680,6 +715,54 @@ EOF\"",
                 println!("⚠️  No unclaimed sites available. Run `mrgarvey new` to provision more.");
             }
         }
+
+        Commands::Attendance {
+            min_unclaimed,
+            interval,
+            domain,
+            multisite_path,
+            do_token,
+            do_ip,
+            caddy_path,
+            caddy_snippet,
+        } => {
+            println!("[ATTENDANCE] Starting roll call...");
+            println!("[ATTENDANCE] Maintaining {} unclaimed sites", min_unclaimed);
+            println!("[ATTENDANCE] Checking every {} seconds", interval);
+            println!();
+
+            loop {
+                let cache = SiteCache::load();
+                let (total, claimed, unclaimed) = cache.stats();
+
+                println!(
+                    "[ATTENDANCE] Roll call: {} total, {} claimed, {} unclaimed",
+                    total, claimed, unclaimed
+                );
+
+                if unclaimed < min_unclaimed {
+                    let needed = min_unclaimed - unclaimed;
+                    println!(
+                        "[ATTENDANCE] Need {} more sites, provisioning 1...",
+                        needed
+                    );
+
+                    // Provision one site at a time to avoid overwhelming the server
+                    provision_site(
+                        &domain,
+                        &multisite_path,
+                        do_token.as_deref(),
+                        do_ip.as_deref(),
+                        &caddy_path,
+                        &caddy_snippet,
+                    );
+                } else {
+                    println!("[ATTENDANCE] Pool is healthy, all seats filled.");
+                }
+
+                std::thread::sleep(std::time::Duration::from_secs(interval));
+            }
+        }
     }
 }
 
@@ -724,6 +807,70 @@ async fn run_server(bind: &str) -> Result<(), String> {
 
     println!("[INFO    ] mrgarvey API server listening on {}", bind);
     server.await
+}
+
+/// Provision a new site (used by both `new` command and `attendance`)
+fn provision_site(
+    domain: &str,
+    multisite_path: &str,
+    do_token: Option<&str>,
+    do_ip: Option<&str>,
+    caddy_path: &str,
+    caddy_snippet: &str,
+) {
+    let slug = generate_slug();
+    let plan = build_site_plan(&slug, domain);
+
+    println!("[PROVISION] Creating site: {}", plan.hostname);
+
+    let db_cmd = format!(
+        "docker exec app bash -lc \"sudo -u postgres createdb {db} && \
+         sudo -u postgres psql {db} <<EOF\n\
+         ALTER SCHEMA public OWNER TO discourse;\n\
+         CREATE EXTENSION IF NOT EXISTS hstore;\n\
+         CREATE EXTENSION IF NOT EXISTS pg_trgm;\n\
+         GRANT ALL PRIVILEGES ON DATABASE {db} TO discourse;\n\
+EOF\"",
+        db = plan.db_name
+    );
+
+    let migrate_cmd = format!(
+        "docker exec app bash -lc \"cd /var/www/discourse && \
+         RAILS_DB={rails_db} sudo -E -u discourse bundle exec rake db:migrate db:seed_fu\"",
+        rails_db = plan.rails_db_key
+    );
+
+    let restart_cmd = "docker exec app sv restart unicorn".to_string();
+
+    // 1) Create DB
+    run_step("create_database", &db_cmd, false);
+
+    // 2) Update multisite.yml
+    update_multisite_file(&plan, multisite_path, false);
+
+    // 3) Migrate & seed
+    run_step("migrate_and_seed", &migrate_cmd, false);
+
+    // 4) Restart unicorn
+    run_step("restart_unicorn", &restart_cmd, false);
+
+    // 5) Create DigitalOcean DNS record (if creds provided)
+    if let (Some(token), Some(ip)) = (do_token, do_ip) {
+        create_digitalocean_dns_record(&plan, ip, token, false);
+    }
+
+    // 6) Caddyfile update + reload
+    update_caddyfile(&plan, caddy_path, caddy_snippet, false);
+    reload_caddy(caddy_path, false);
+
+    // Add to cache
+    let mut cache = SiteCache::load();
+    cache.add_site(plan.rails_db_key.clone(), plan.hostname.clone());
+    if let Err(e) = cache.save() {
+        eprintln!("[WARN    ] failed to update cache: {}", e);
+    }
+
+    println!("[PROVISION] Site {} ready", plan.hostname);
 }
 
 /// Run a shell command, or just print it if dry_run is true.
